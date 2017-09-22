@@ -68,4 +68,41 @@ storiesOf('Buttons', module)
         </Item>
       </div>
     ))
+  )
+  .add(
+    'states',
+    withInfo('Different button states')(() => (
+      <div>
+        <Item>
+          <Button busy priority="primary" size="xsmall">
+            Extra Small
+          </Button>
+        </Item>
+
+        <Item>
+          <Button busy priority="primary" size="small">
+            Small
+          </Button>
+        </Item>
+
+        <Item>
+          <Button busy priority="primary">
+            Normal
+          </Button>
+        </Item>
+
+        <Item>
+          <Button busy priority="primary" size="large">
+            Large
+          </Button>
+        </Item>
+
+        <Item>
+          <Button priority="primary" disabled onClick={action('click disabled')}>
+            Disabled Button
+          </Button>
+        </Item>
+
+      </div>
+    ))
   );
