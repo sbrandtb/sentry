@@ -36,7 +36,13 @@ class IssueGroupActionEndpoint(PluginGroupEndpoint):
 
 class IssueTrackingPlugin2(Plugin):
     auth_provider = None
+
     allowed_actions = ('create', 'link', 'unlink')
+
+    # we default this to None to support legacy integrations, but newer style
+    # should explicitly call out what is stored
+    issue_fields = None
+    # issue_fields = frozenset(['id', 'title', 'url'])
 
     def configure(self, project, request):
         return react_plugin_config(self, project, request)
@@ -191,17 +197,45 @@ class IssueTrackingPlugin2(Plugin):
                     errors[field['name']] = u'%s is a required field.' % field['label']
         return errors
 
+    def get_issue_field_map(self):
+        # XXX(dcramer): legacy support
+        conf_key = self.get_conf_key()
+        if self.issue_fields is None:
+            return {
+                'id': '{}:tid'.format(conf_key)
+            }
+        return {
+            key: '{}:issue_{}'.format(
+                conf_key,
+                key,
+            )
+            for key in self.issue_fields
+        }
+
+    def build_issue(self, group):
+        issue_field_map = self.get_issue_field_map()
+        issue = {}
+        for key, meta_name in six.iteritems(issue_field_map):
+            issue[key] = GroupMeta.objects.get_value(group, meta_name, None)
+        if not any(issue.values()):
+            return None
+        return issue
+
+    def has_linked_issue(self, group):
+        return bool(self.build_issue(group))
+
+    def unlink_issue(self, request, group, issue, **kwargs):
+        issue_field_map = self.get_issue_field_map()
+        for meta_name in six.itervalues(issue_field_map):
+            GroupMeta.objects.unset_value(group, meta_name)
+        return self.redirect(group.get_absolute_url())
+
     def view_create(self, request, group, **kwargs):
         auth_errors = self.check_config_and_auth(request, group)
         if auth_errors:
             return Response(auth_errors, status=400)
 
         event = group.get_latest_event()
-        if event is None:
-            return Response({
-                'message': 'Unable to create issues: there are '
-                           'no events associated with this group',
-            }, status=400)
         Event.objects.bind_nodes([event], 'data')
         try:
             fields = self.get_new_issue_fields(request, group, event, **kwargs)
@@ -215,20 +249,27 @@ class IssueTrackingPlugin2(Plugin):
             return Response({'error_type': 'validation', 'errors': errors}, status=400)
 
         try:
-            issue_id = self.create_issue(
+            issue = self.create_issue(
                 group=group,
                 form_data=request.DATA,
                 request=request,
             )
         except Exception as e:
             return self.handle_api_error(e)
-        GroupMeta.objects.set_value(group, '%s:tid' % self.get_conf_key(), issue_id)
+
+        conf_key = self.get_conf_key()
+        for key in self.issue_fields:
+            meta_name = '{}:issue_{}'.format(conf_key, key)
+            if key in issue:
+                GroupMeta.objects.set_value(group, meta_name, issue[key])
+            else:
+                GroupMeta.objects.unset_value(group, meta_name)
 
         issue_information = {
             'title': request.DATA['title'],
             'provider': self.get_title(),
-            'location': self.get_issue_url(group, issue_id),
-            'label': self.get_issue_label(group=group, issue_id=issue_id),
+            'location': self.get_issue_url(group, issue),
+            'label': self.get_issue_label(group=group, issue=issue),
         }
         Activity.objects.create(
             project=group.project,
@@ -239,26 +280,25 @@ class IssueTrackingPlugin2(Plugin):
         )
 
         issue_tracker_used.send(
-            plugin=self, project=group.project, user=request.user, sender=IssueTrackingPlugin2
+            plugin=self, project=group.project, user=request.user,
+            sender=type(self)
         )
-        return Response({'issue_url': self.get_issue_url(group=group, issue_id=issue_id)})
-
-    def view_unlink(self, request, group, **kwargs):
-        auth_errors = self.check_config_and_auth(request, group)
-        if auth_errors:
-            return Response(auth_errors, status=400)
-        if GroupMeta.objects.get_value(group, '%s:tid' % self.get_conf_key(), None):
-            if 'unlink' in self.allowed_actions:
-                GroupMeta.objects.unset_value(group, '%s:tid' % self.get_conf_key())
-                return Response({'message': 'Successfully unlinked issue.'})
-        return Response({'message': 'No issues to unlink.'}, status=400)
+        return Response({'issue_url': self.get_issue_url(group=group, issue=issue)})
 
     def view_link(self, request, group, **kwargs):
         auth_errors = self.check_config_and_auth(request, group)
         if auth_errors:
             return Response(auth_errors, status=400)
+
         event = group.get_latest_event()
+        if event is None:
+            return Response({
+                'message': 'Unable to create issues: there are '
+                           'no events associated with this group',
+            }, status=400)
+
         Event.objects.bind_nodes([event], 'data')
+
         try:
             fields = self.get_link_existing_issue_fields(request, group, event, **kwargs)
         except Exception as e:
@@ -270,30 +310,27 @@ class IssueTrackingPlugin2(Plugin):
             return Response({'error_type': 'validation', 'errors': errors}, status=400)
 
         try:
-            issue_id = int(request.DATA['issue_id'])
-        except ValueError:
-            issue_id = request.DATA['issue_id']
-
-        try:
             issue = self.link_issue(
                 group=group,
                 form_data=request.DATA,
                 request=request,
             )
-            if issue is None:
-                issue = {
-                    'title': self.get_issue_title_by_id(request, group, issue_id),
-                }
         except Exception as e:
             return self.handle_api_error(e)
 
-        GroupMeta.objects.set_value(group, '%s:tid' % self.get_conf_key(), issue_id)
+        conf_key = self.get_conf_key()
+        for key in self.issue_fields:
+            meta_name = '{}:issue_{}'.format(conf_key, key)
+            if key in issue:
+                GroupMeta.objects.set_value(group, meta_name, issue[key])
+            else:
+                GroupMeta.objects.unset_value(group, meta_name)
 
         issue_information = {
             'title': issue['title'],
             'provider': self.get_title(),
-            'location': self.get_issue_url(group, issue_id),
-            'label': self.get_issue_label(group=group, issue_id=issue_id),
+            'location': self.get_issue_url(group, issue),
+            'label': self.get_issue_label(group=group, issue=issue),
         }
         Activity.objects.create(
             project=group.project,
@@ -303,6 +340,37 @@ class IssueTrackingPlugin2(Plugin):
             data=issue_information,
         )
         return Response({'message': 'Successfully linked issue.'})
+
+    def view_unlink(self, request, group, **kwargs):
+        auth_errors = self.check_config_and_auth(request, group)
+        if auth_errors:
+            return Response(auth_errors, status=400)
+        issue = self.build_issue(group)
+        if issue and 'unlink' in self.allowed_actions:
+            self.unlink_issue(request, group, issue)
+            return Response({'message': 'Successfully unlinked issue.'})
+        return Response({'message': 'No issues to unlink.'}, status=400)
+
+    def plugin_issues(self, request, group, plugin_issues, **kwargs):
+        if not self.is_configured(request=request, project=group.project):
+            return plugin_issues
+
+        item = {
+            'slug': self.slug,
+            'allowed_actions': self.allowed_actions,
+            'title': self.get_title()
+        }
+        issue = self.build_issue(group)
+        if issue:
+            item['issue'] = {
+                'issue_id': issue.get('id'),
+                'url': self.get_issue_url(group=group, issue=issue),
+                'label': self.get_issue_label(group=group, issue=issue),
+            }
+
+        item.update(PluginSerializer(group.project).serialize(self, None, request.user))
+        plugin_issues.append(item)
+        return plugin_issues
 
     def get_config(self, *args, **kwargs):
         # TODO(dcramer): update existing plugins to just use get_config
@@ -332,30 +400,6 @@ class IssueTrackingPlugin2(Plugin):
                 'error_type': 'auth',
                 'auth_url': reverse('socialauth_associate', args=[self.auth_provider])
             }
-
-    def plugin_issues(self, request, group, plugin_issues, **kwargs):
-        if not self.is_configured(request=request, project=group.project):
-            return plugin_issues
-        prefix = self.get_conf_key()
-        issue_id = GroupMeta.objects.get_value(group, '%s:tid' % prefix, None)
-        item = {
-            'slug': self.slug,
-            'allowed_actions': self.allowed_actions,
-            # TODO(dcramer): remove in Sentry 8.22+
-            'title': self.get_title(),
-            'name': self.get_title(),
-            'shortName': self.get_short_title(),
-        }
-        if issue_id:
-            item['issue'] = {
-                'issue_id': issue_id,
-                'url': self.get_issue_url(group=group, issue_id=issue_id),
-                'label': self.get_issue_label(group=group, issue_id=issue_id),
-            }
-
-        item.update(PluginSerializer(group.project).serialize(self, None, request.user))
-        plugin_issues.append(item)
-        return plugin_issues
 
     # TODO: should we get rid of this (move it to react?)
     def tags(self, request, group, tag_list, **kwargs):
